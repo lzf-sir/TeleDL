@@ -1,0 +1,32 @@
+# Python字节码
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 环境变量
+.env
+!.env.example
+
+# 下载文件
+/downloads/
+
+# 数据文件
+/data/
+
+# 日志文件
+/logs/
+
+# 虚拟环境
+venv/
+env/
+.env/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 编辑器文件
+.idea/
+.vscode/
+*.swp
+*.swo

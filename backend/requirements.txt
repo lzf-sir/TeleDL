@@ -1,0 +1,23 @@
+# 核心框架
+fastapi>=0.103.1
+uvicorn>=0.23.2
+
+# 异步网络与IO
+aiohttp>=3.8.5
+aiofiles>=23.2.1
+
+# BT下载
+libtorrent>=2.0.9
+
+# 类型与数据验证
+pydantic>=2.4.2
+pydantic-settings>=2.0.3
+
+# 文件类型识别
+python-magic-bin>=0.4.14  # Windows
+# python-magic>=0.4.27  # Linux/Mac (取消注释并注释上面一行)
+
+# 开发工具
+pytest>=7.4.3
+
+uvicorn>=0.23.2
