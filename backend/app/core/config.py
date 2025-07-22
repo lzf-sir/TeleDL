@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     save_history: bool = True
     history_max_count: int = 1000
 
+    # 数据库配置
+    database_url: str = "sqlite:///data/db.sqlite3"
+
     class Config:
         case_sensitive = False
         env_file = ".env"

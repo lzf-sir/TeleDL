@@ -23,5 +23,22 @@ npm run build
 - axios
 - vite
 
+## Docker 部署
+
+1. 构建 Docker 镜像：
+   ```bash
+   docker build -t tele-frontend .
+   ```
+
+2. 启动容器：
+   ```bash
+   docker run -p 3000:3000 tele-frontend
+   ```
+
+## 注意事项
+
+- 确保后端服务已启动并运行。
+- 默认访问地址为 `http://localhost:3000`。
+
 ---
 如需自定义主题或扩展页面，请参考 Element Plus 官方文档。

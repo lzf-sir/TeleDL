@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: tele-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    command: python main.py
+    depends_on:
+      - db
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: tele-frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+    command: npm run dev
+    depends_on:
+      - backend
+
+  db:
+    image: postgres:15
+    container_name: tele-db
+    environment:
+      POSTGRES_USER: teleuser
+      POSTGRES_PASSWORD: telepassword
+      POSTGRES_DB: teledb
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+volumes:
+  db_data:
