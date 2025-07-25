@@ -27,8 +27,6 @@ def create_app() -> FastAPI:
     # 注册路由
     app.include_router(api_router, prefix=settings.api_prefix)
 
-
-
     # 推荐方式：用 on_event 装饰器注册事件，保证 await
     @app.on_event("startup")
     async def _startup():

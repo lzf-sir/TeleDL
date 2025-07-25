@@ -1,95 +1,10 @@
-async def pause_download(task_id: str):
-    """暂停下载任务（仅HTTP）"""
-    task = download_tasks.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if task.status not in [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING]:
-        raise HTTPException(status_code=400, detail="任务状态不支持暂停")
-    task.status = DownloadStatus.PAUSED
-    await notify_task_update(task_id)
-    return {"message": "任务已暂停"}
-# ========== 分类常量 ==========
-DEFAULT_CATEGORY = "other"
-FILE_CATEGORIES = {
-    "http": {"description": "普通文件（HTTP/HTTPS下载）"},
-    DEFAULT_CATEGORY: {"description": "其他文件"}
-}
-# ========== 任务管理API接口 ==========
-from fastapi import HTTPException
+"""
+下载管理器核心模块
+处理所有下载任务的生命周期管理
+支持HTTP/FTP等协议下载
+提供任务队列、状态跟踪和通知功能
+"""
 
-async def get_download_tasks(status=None, download_type=None, category=None, limit=100, offset=0):
-    """获取下载任务列表，支持筛选和分页"""
-    tasks = list(download_tasks.values())
-    if status:
-        tasks = [t for t in tasks if t.status == status]
-    if download_type:
-        tasks = [t for t in tasks if t.download_type == download_type]
-    if category:
-        tasks = [t for t in tasks if t.category == category]
-    # 按创建时间降序
-    tasks.sort(key=lambda t: t.start_time or 0, reverse=True)
-    total = len(tasks)
-    items = [DownloadTaskDetail(**t.dict()) for t in tasks[offset:offset+limit]]
-    return {"items": items, "total": total}
-
-async def get_download_task(task_id: str):
-    """获取单个下载任务详情"""
-    task = download_tasks.get(task_id) or history_tasks.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    return DownloadTaskDetail(**task.dict())
-
-async def get_task_files(task_id: str):
-    """获取下载任务的文件列表（HTTP只返回主文件）"""
-    task = download_tasks.get(task_id) or history_tasks.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    file_info = FileInfo(
-        name=Path(task.file_path).name if task.file_path else task.filename,
-        path=task.file_path or "",
-        size=task.total_size,
-        is_dir=False
-    )
-    return FileListResponse(files=[file_info])
-
-async def resume_download(task_id: str):
-    """恢复暂停/失败的下载任务（仅HTTP）"""
-    task = download_tasks.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if task.status not in [DownloadStatus.PAUSED, DownloadStatus.FAILED]:
-        raise HTTPException(status_code=400, detail="任务状态不支持恢复")
-    task.status = DownloadStatus.QUEUED
-    await download_queue.put(task_id)
-    await notify_task_update(task_id)
-    return {"message": "任务已恢复"}
-
-async def cancel_download(task_id: str):
-    """取消下载任务（仅HTTP）"""
-    task = download_tasks.get(task_id)
-    if task:
-        # 只要任务存在于活跃任务，直接标记为已取消并移除
-        task.status = DownloadStatus.CANCELLED
-        await notify_task_update(task_id)
-        # 可选：移除文件、清理资源等
-        del download_tasks[task_id]
-        return {"message": "任务已取消"}
-    # 如果不在活跃任务，尝试从历史记录中删除
-    if task_id in history_tasks:
-        del history_tasks[task_id]
-        return {"message": "历史任务已删除"}
-    raise HTTPException(status_code=404, detail="任务不存在")
-async def init_download_manager():
-    """初始化下载管理器，加载历史和活跃任务，启动定时保存任务状态协程。"""
-    await load_history()
-    await load_active_tasks()
-    # 启动定时保存任务状态的后台任务
-    asyncio.create_task(save_task_state_periodically())
-
-async def cleanup_resources():
-    """清理资源，保存当前任务和历史记录。"""
-    await save_active_tasks()
-    await save_history()
 import os
 import uuid
 import time
@@ -98,588 +13,520 @@ import shutil
 import asyncio
 import aiohttp
 import aiofiles
-import tempfile
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional, Dict, Any, Literal, Tuple
-import magic
+from typing import Dict, Optional, List
 import logging
+from fastapi import HTTPException, Depends
+from sqlalchemy.orm import Session
+import urllib
 
 from app.core.config import settings
+from app.core.config_manager import ConfigManager
+from app.core.download_config_manager import DownloadConfigManager, DownloadConfig
+from app.db.session import get_db
 from app.schemas.download import (
-    DownloadTask, DownloadStatus, DownloadType, 
-    PriorityLevel, DownloadTaskDetail
+    DownloadTask, DownloadStatus, DownloadType,
+    DownloadTaskDetail, DownloadTaskListResponse
 )
 from app.schemas.file import FileInfo, FileListResponse
-from app.utils.formatters import format_size, format_speed, format_duration
 from app.utils.logger import setup_logger
 from app.websocket_manager import websocket_manager
 
-# 初始化日志
 logger = setup_logger(__name__)
 
-# 全局存储
-download_tasks: Dict[str, DownloadTask] = {}
-history_tasks: Dict[str, DownloadTask] = {}
-download_queue = None
+# 文件分类常量
+FILE_CATEGORIES = {
+    "video": [".mp4", ".avi", ".mkv", ".mov", ".wmv"],
+    "audio": [".mp3", ".wav", ".flac", ".aac", ".ogg"],
+    "image": [".jpg", ".jpeg", ".png", ".gif", ".bmp"],
+    "document": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt"],
+    "archive": [".zip", ".rar", ".7z", ".tar", ".gz"],
+    "executable": [".exe", ".msi", ".dmg", ".pkg", ".deb"],
+    "other": []
+}
+
+DEFAULT_CATEGORY = "other"
+
+class DownloadManager:
+    """单例下载管理器"""
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._init_manager()
+        return cls._instance
+    
+    def _init_manager(self):
+        """初始化管理器状态"""
+        self.download_tasks: Dict[str, DownloadTask] = {}
+        self.history_tasks: Dict[str, DownloadTask] = {}
+        self.download_queue: Optional[asyncio.Queue] = None
+        self.task_locks: Dict[str, asyncio.Lock] = {}
+        self._last_notify_time: Dict[str, float] = {}  # 任务ID: 上次通知时间戳
+        self._initialized = False
+        self._notify_interval = 3  # 默认3秒推送间隔
+
+# 创建单例实例
+download_manager = DownloadManager()
 
 async def init_download_manager():
-    global download_queue
-    download_queue = asyncio.Queue()
-task_locks: Dict[str, asyncio.Lock] = {}
-
-
-async def load_history():
-    global history_tasks
-    """加载历史记录"""
-    history_path = settings.history_file
+    """初始化下载管理器
+    1. 创建任务队列
+    2. 启动后台处理任务
+    """
+    logger.debug(f"初始化前download_manager状态: {download_manager.__dict__}")
     
-    if history_path.exists():
+    download_manager.download_queue = asyncio.Queue()
+    download_manager.download_tasks = {}
+    download_manager.history_tasks = {}
+    download_manager.task_locks = {}
+    
+    asyncio.create_task(process_download_queue())
+    download_manager._initialized = True
+    logger.info("下载管理器初始化完成")
+    logger.debug(f"初始化后download_manager状态: {download_manager.__dict__}")
+
+async def load_tasks_on_startup(db: Session):
+    """应用启动时加载任务"""
+    await _load_history(db)
+    await _load_active_tasks(db)
+    asyncio.create_task(_save_task_state_periodically(db))
+
+async def create_download_task(url: str, **kwargs) -> str:
+    """创建新的下载任务
+    Args:
+        url: 下载URL
+        kwargs: 额外参数(download_type, priority等)
+    Returns:
+        任务ID
+    """
+    task_id = str(uuid.uuid4())
+    # 确保download_type只传递一次
+    download_type = kwargs.pop("download_type", DownloadType.HTTP)
+    task = DownloadTask(
+        id=task_id,
+        url=url,
+        download_type=download_type,
+        status=DownloadStatus.QUEUED,
+        **kwargs
+    )
+    download_manager.download_tasks[task_id] = task
+    download_manager.task_locks[task_id] = asyncio.Lock()
+    await download_manager.download_queue.put(task_id)
+    await _notify_task_update(task_id)
+    return task_id
+
+async def get_download_tasks(
+    status: Optional[DownloadStatus] = None,
+    download_type: Optional[DownloadType] = None,
+    limit: int = 100,
+    offset: int = 0
+) -> DownloadTaskListResponse:
+    """获取下载任务列表"""
+    tasks = list(download_manager.download_tasks.values())
+    if status:
+        tasks = [t for t in tasks if t.status == status]
+    if download_type:
+        tasks = [t for t in tasks if t.download_type == download_type]
+    tasks.sort(key=lambda t: t.start_time or 0, reverse=True)
+    return DownloadTaskListResponse(
+        items=[DownloadTaskDetail.from_task(t) for t in tasks[offset:offset+limit]],
+        total=len(tasks)
+    )
+
+async def get_download_task(task_id: str) -> DownloadTaskDetail:
+    """获取单个任务详情"""
+    task = download_manager.download_tasks.get(task_id) or download_manager.history_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return DownloadTaskDetail(**task.dict())
+
+async def get_task_files(task_id: str) -> FileListResponse:
+    """获取任务文件列表"""
+    task = download_manager.download_tasks.get(task_id) or download_manager.history_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return FileListResponse(files=[FileInfo(
+        name=Path(task.file_path).name if task.file_path else task.filename,
+        path=task.file_path or "",
+        size=task.total_size,
+        is_dir=False
+    )])
+
+async def resume_download(task_id: str) -> Dict[str, str]:
+    """恢复下载任务"""
+    task = download_manager.download_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.status not in [DownloadStatus.PAUSED, DownloadStatus.FAILED]:
+        raise HTTPException(status_code=400, detail="任务状态不支持恢复")
+    task.status = DownloadStatus.QUEUED
+    await download_manager.download_queue.put(task_id)
+    await _notify_task_update(task_id)
+    return {
+        "success": "true",
+        "code": "200",
+        "data": json.dumps({"message": "任务已恢复"})
+    }
+
+async def pause_download(task_id: str, db: Session = Depends(get_db)) -> Dict[str, str]:
+    """暂停下载任务"""
+    task = download_manager.download_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.status != DownloadStatus.DOWNLOADING:
+        raise HTTPException(status_code=400, detail="只有正在下载的任务可以暂停")
+    
+    task.status = DownloadStatus.PAUSED
+    await _notify_task_update(task_id)
+    await _save_active_tasks(db)
+    
+    return {
+        "success": "true",
+        "code": "200",
+        "data": json.dumps({"message": "任务已暂停"})
+    }
+
+async def cancel_download(task_id: str, db: Session = Depends(get_db)) -> Dict[str, str]:
+    """取消下载任务"""
+    task = download_manager.download_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    
+    task.status = DownloadStatus.CANCELLED
+    task.end_time = datetime.now()
+    
+    # 清理临时文件
+    temp_file = getattr(task, 'temp_file', None)
+    if temp_file and os.path.exists(temp_file):
         try:
-            async with aiofiles.open(history_path, "r") as f:
-                content = await f.read()
-                history_data = json.loads(content)
-                
-                # 转换为DownloadTask对象
-                history_tasks = {
-                    task_id: DownloadTask(**task_data)
-                    for task_id, task_data in history_data.items()
-                }
-                
-                logger.info(f"已加载 {len(history_tasks)} 条历史记录")
+            os.remove(temp_file)
         except Exception as e:
-            logger.error(f"加载历史记录失败: {str(e)}")
-            history_tasks = {}
-    else:
-        logger.info("没有找到历史记录文件，将创建新的")
-        history_tasks = {}
+            logger.error(f"删除临时文件失败: {str(e)}")
+    
+    # 移动到历史记录
+    download_manager.history_tasks[task_id] = task
+    download_manager.download_tasks.pop(task_id, None)
+    
+    await _notify_task_update(task_id)
+    await _save_history(db)
+    
+    return {
+        "success": "true",
+        "code": "200",
+        "data": json.dumps({"message": "任务已取消"})
+    }
 
+async def cleanup_resources(db: Session = Depends(get_db)):
+    """清理资源并保存状态"""
+    await _save_active_tasks(db)
+    await _save_history(db)
 
-async def save_history():
-    global history_tasks
-    """保存历史记录"""
-    if not settings.save_history:
+# 私有方法
+async def process_download_queue():
+    """处理下载队列中的任务(公共方法)"""
+    while True:
+        task_id = await download_manager.download_queue.get()
+        async with download_manager.task_locks[task_id]:
+            await _download_file(task_id)
+
+async def _download_file(task_id: str):
+    """实际下载文件实现"""
+    task = download_manager.download_tasks[task_id]
+    config = DownloadConfigManager().get_config()
+    
+    try:
+        task.status = DownloadStatus.DOWNLOADING
+        task.start_time = datetime.now()
+        await _notify_task_update(task_id)
+        
+        # 创建下载目录
+        download_dir = Path(config.download_dir)
+        if not download_dir.exists():
+            download_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 获取文件名
+        filename = task.filename or extract_filename_from_url(task.url)
+        file_path = download_dir / filename
+        
+        # 断点续传支持
+        temp_file = file_path.with_suffix('.part')
+        downloaded_bytes = temp_file.stat().st_size if temp_file.exists() else 0
+        
+        # 设置HTTP头
+        headers = {}
+        if downloaded_bytes > 0:
+            headers['Range'] = f'bytes={downloaded_bytes}-'
+        
+        # 下载参数
+        timeout = aiohttp.ClientTimeout(total=config.timeout)
+        connector = aiohttp.TCPConnector(limit=config.max_concurrent_downloads)
+        
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            async with session.get(task.url, headers=headers) as response:
+                if response.status not in (200, 206):
+                    raise HTTPException(
+                        status_code=response.status,
+                        detail=f"下载失败: HTTP {response.status}"
+                    )
+                
+                # 获取文件总大小
+                total_size = int(response.headers.get('content-length', 0)) + downloaded_bytes
+                task.total_size = total_size
+                
+                # 分块下载
+                chunk_size = config.chunk_size
+                last_update_time = time.time()
+                last_downloaded_bytes = downloaded_bytes
+                async with aiofiles.open(temp_file, 'ab') as f:
+                    async for chunk in response.content.iter_chunked(chunk_size):
+                        await f.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        
+                        # 计算下载速度 (字节/秒)
+                        now = time.time()
+                        time_diff = now - last_update_time
+                        if time_diff > 0.5:  # 每0.5秒更新一次速度
+                            speed = (downloaded_bytes - last_downloaded_bytes) / time_diff
+                            task.download_speed = int(speed)  # 使用schema中定义的download_speed字段
+                            last_update_time = now
+                            last_downloaded_bytes = downloaded_bytes
+                        
+                        task.progress = int((downloaded_bytes / total_size) * 100)
+                        await _notify_task_update(task_id)
+                        
+                        # 检查任务是否被取消或暂停
+                        if task.status != DownloadStatus.DOWNLOADING:
+                            return
+        
+        # 下载完成，重命名临时文件
+        temp_file.rename(file_path)
+        task.file_path = str(file_path)
+        task.status = DownloadStatus.COMPLETED
+        task.end_time = datetime.now()
+        
+    except Exception as e:
+        task.status = DownloadStatus.FAILED
+        task.error = str(e)
+        
+        # 自动重试逻辑
+        if task.retry_count < config.retry_attempts:
+            task.retry_count += 1
+            await asyncio.sleep(config.retry_delay)
+            task.status = DownloadStatus.QUEUED
+            await download_manager.download_queue.put(task_id)
+        else:
+            # 重试次数用完，标记为失败
+            task.status = DownloadStatus.FAILED
+        
+    finally:
+        await _notify_task_update(task_id)
+        if task.status == DownloadStatus.COMPLETED:
+            # 移动到历史记录
+            download_manager.history_tasks[task_id] = task
+            download_manager.download_tasks.pop(task_id, None)
+            
+            # 分类文件
+            await _categorize_file(task, config)
+
+async def _categorize_file(task: DownloadTask, config: DownloadConfig):
+    """根据配置分类文件"""
+    if not config.category_subdirs or not task.file_path:
         return
         
-    history_path = settings.history_file
-    try:
-        # 限制历史记录数量
-        if len(history_tasks) > settings.history_max_count:
-            # 按结束时间排序，保留最新的记录
-            sorted_tasks = sorted(
-                history_tasks.values(), 
-                key=lambda x: x.end_time if x.end_time else 0, 
-                reverse=True
-            )
-            keep_tasks = sorted_tasks[:settings.history_max_count]
-            history_tasks = {task.id: task for task in keep_tasks}
-        
-        # 转换为字典并保存
-        history_data = {
-            task_id: task.dict()
-            for task_id, task in history_tasks.items()
-        }
-        
-        async with aiofiles.open(history_path, "w") as f:
-            await f.write(json.dumps(history_data, indent=4))
-        
-        logger.debug(f"已保存 {len(history_tasks)} 条历史记录")
-    except Exception as e:
-        logger.error(f"保存历史记录失败: {str(e)}")
-
-
-async def load_active_tasks():
-    """加载活跃任务"""
-    tasks_path = settings.tasks_file
+    file_path = Path(task.file_path)
+    ext = file_path.suffix.lower()
+    category = DEFAULT_CATEGORY
     
-    if tasks_path.exists():
-        try:
-            async with aiofiles.open(tasks_path, "r") as f:
-                content = await f.read()
-                tasks_data = json.loads(content)
-                
-                # 转换为DownloadTask对象并重置状态
-                download_tasks = {}
-                for task_id, task_data in tasks_data.items():
-                    if task_data["status"] == DownloadStatus.DOWNLOADING:
-                        task_data["status"] = DownloadStatus.QUEUED
-                        task_data["retry_count"] = 0
-                    
-                    download_tasks[task_id] = DownloadTask(** task_data)
-                    task_locks[task_id] = asyncio.Lock()
-                    
-                    # 添加到队列
-                    if task_data["status"] == DownloadStatus.QUEUED:
-                        await download_queue.put(task_id)
-                
-                logger.info(f"已加载 {len(download_tasks)} 个活跃任务")
-        except Exception as e:
-            logger.error(f"加载活跃任务失败: {str(e)}")
-            download_tasks = {}
-            task_locks = {}
-    else:
-        logger.info("没有找到活跃任务文件，将创建新的")
-        download_tasks = {}
-        task_locks = {}
+    for cat, exts in FILE_CATEGORIES.items():
+        if ext in exts:
+            category = cat
+            break
+            
+    category_dir = file_path.parent / category
+    category_dir.mkdir(exist_ok=True)
+    
+    new_path = category_dir / file_path.name
+    shutil.move(str(file_path), str(new_path))
+    task.file_path = str(new_path)
 
-
-async def save_active_tasks():
-    """保存活跃任务"""
-    tasks_path = settings.tasks_file
+def extract_filename_from_url(url: str) -> str:
+    """从URL提取文件名"""
     try:
-        active_tasks = {
-            task_id: task.dict()
-            for task_id, task in download_tasks.items()
-            if task.status in [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING]
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path
+        filename = path.split('/')[-1] if path else "unnamed"
+        return filename or "unnamed"
+    except:
+        return "unnamed"
+
+async def _notify_task_update(task_id: str):
+    """发送WebSocket通知，限制推送频率"""
+    task = download_manager.download_tasks.get(task_id) or download_manager.history_tasks.get(task_id)
+    if not task:
+        return
+        
+    current_time = time.time()
+    last_notify = download_manager._last_notify_time.get(task_id, 0)
+    
+    # 状态变化(如完成/失败)立即通知，否则检查间隔
+    status_changed = (
+        task.status in (DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED) or
+        (task_id in download_manager._last_notify_time and 
+         task.status != download_manager.download_tasks.get(task_id, task).status)
+    )
+    
+    if status_changed or current_time - last_notify >= download_manager._notify_interval:
+        logger.info(f"Sending WebSocket update for task {task_id}: status={task.status}, progress={task.progress}, speed={getattr(task, 'download_speed', 0)}")
+        try:
+            # 准备payload数据
+            payload = {
+                "task_id": task_id,
+                "status": str(task.status),
+                "progress": task.progress,
+                "speed": getattr(task, 'download_speed', 0),
+                "download_speed": getattr(task, 'download_speed', 0)
+            }
+            
+            # 转换datetime字段
+            if task.start_time:
+                payload["start_time"] = task.start_time.isoformat()
+            if task.end_time:
+                payload["end_time"] = task.end_time.isoformat()
+                
+            await websocket_manager.broadcast({
+                "type": "downloads",
+                "payload": payload
+            })
+            
+            # 更新最后通知时间
+            download_manager._last_notify_time[task_id] = current_time
+        except Exception as e:
+            logger.error(f"Failed to send WebSocket update for task {task_id}: {str(e)}")
+
+def _convert_datetime(obj):
+    """递归转换datetime对象为字符串"""
+    if isinstance(obj, dict):
+        return {k: _convert_datetime(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_convert_datetime(v) for v in obj]
+    elif isinstance(obj, datetime):
+        return obj.isoformat()
+    return obj
+
+async def _save_active_tasks(db: Session):
+    """保存活跃任务到数据库"""
+    try:
+        config_manager = ConfigManager(db)
+        tasks_data = {
+            k: _convert_datetime(v.dict()) 
+            for k, v in download_manager.download_tasks.items()
         }
-        
-        async with aiofiles.open(tasks_path, "w") as f:
-            await f.write(json.dumps(active_tasks, indent=4))
-        
-        logger.debug(f"已保存 {len(active_tasks)} 个活跃任务")
+        config_manager.set("active_download_tasks", tasks_data, "当前活跃下载任务")
+        logger.info(f"成功保存{len(tasks_data)}个活跃任务")
     except Exception as e:
         logger.error(f"保存活跃任务失败: {str(e)}")
 
+async def _save_history(db: Session):
+    """保存历史记录到数据库"""
+    try:
+        config_manager = ConfigManager(db)
+        history_data = {k: v.dict() for k, v in download_manager.history_tasks.items()}
+        config_manager.set("download_history", history_data, "下载历史记录")
+        logger.info(f"成功保存{len(history_data)}条历史记录")
+    except Exception as e:
+        logger.error(f"保存历史记录失败: {str(e)}")
 
-async def save_task_state_periodically():
+async def _load_active_tasks(db: Session):
+    """从数据库加载活跃任务"""
+    try:
+        config_manager = ConfigManager(db)
+        data = config_manager.get("active_download_tasks", {})
+        loaded_count = 0
+        # 清空现有任务避免重复
+        download_manager.download_tasks.clear()
+        download_manager.task_locks.clear()
+        
+        for task_id, task_data in data.items():
+            try:
+                # 确保task_data是字典且包含必要字段
+                if not isinstance(task_data, dict):
+                    logger.warning(f"任务{task_id}数据格式无效: {type(task_data)}")
+                    continue
+                    
+                # 转换数据为DownloadTask
+                logger.debug(f"正在加载任务{task_id}数据: {task_data}")
+                logger.debug(f"DownloadTask模型字段: {DownloadTask.__fields__.keys()}")
+                logger.debug(f"任务数据字段: {task_data.keys()}")
+                
+                # 检查缺失字段
+                missing_fields = set(DownloadTask.__fields__.keys()) - set(task_data.keys())
+                if missing_fields:
+                    logger.warning(f"任务{task_id}缺失字段: {missing_fields}")
+                    # 为缺失字段设置默认值
+                    for field in missing_fields:
+                        task_data[field] = None
+                
+                # 转换时间字段
+                if 'start_time' in task_data and isinstance(task_data['start_time'], str):
+                    try:
+                        task_data['start_time'] = datetime.fromisoformat(task_data['start_time']).timestamp()
+                    except:
+                        task_data['start_time'] = None
+                
+                if 'end_time' in task_data and isinstance(task_data['end_time'], str):
+                    try:
+                        task_data['end_time'] = datetime.fromisoformat(task_data['end_time']).timestamp()
+                    except:
+                        task_data['end_time'] = None
+                
+                task = DownloadTask(**task_data)
+                download_manager.download_tasks[task_id] = task
+                download_manager.task_locks[task_id] = asyncio.Lock()
+                loaded_count += 1
+                logger.debug(f"成功加载任务{task_id}: {task}")
+                logger.debug(f"当前download_tasks内容: {download_manager.download_tasks}")
+            except Exception as e:
+                logger.error(f"加载任务{task_id}失败: {str(e)}")
+                logger.debug(f"失败的任务数据: {task_data}")
+                logger.debug(f"DownloadTask模型字段: {DownloadTask.__fields__.keys()}")
+                
+        logger.info(f"成功加载{loaded_count}/{len(data)}个活跃任务")
+        if loaded_count != len(data):
+            logger.warning(f"有{len(data)-loaded_count}个任务加载失败")
+    except Exception as e:
+        logger.error(f"加载活跃任务失败: {str(e)}")
+
+async def _load_history(db: Session):
+    """从数据库加载历史记录"""
+    try:
+        config_manager = ConfigManager(db)
+        data = config_manager.get("download_history", {})
+        download_manager.history_tasks.update({k: DownloadTask(**v) for k, v in data.items()})
+        logger.info(f"成功加载{len(data)}条历史记录")
+    except Exception as e:
+        logger.error(f"加载历史记录失败: {str(e)}")
+
+async def _save_task_state_periodically(db: Session = Depends(get_db)):
     """定期保存任务状态"""
     while True:
-        await save_active_tasks()
-        await asyncio.sleep(settings.state_save_interval)
+        await asyncio.sleep(60)
+        await _save_active_tasks(db)
 
-
-async def process_download_queue():
-    """处理下载队列（异步）"""
-    logger.info("下载队列处理器已启动")
-    
-    # 创建信号量控制并发下载数
-    semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
-    
-    while True:
-        # 获取任务ID
-        task_id = await download_queue.get()
-        task = download_tasks.get(task_id)
-        
-        if not task or task.status != DownloadStatus.QUEUED:
-            download_queue.task_done()
-            continue
-        
-        logger.info(f"开始处理任务: {task_id} ({task.url})")
-        
-        # 使用信号量控制并发
-        async with semaphore:
-            try:
-                await download_file(task_id)
-            except Exception as e:
-                logger.error(f"处理任务 {task_id} 时出错: {str(e)}")
-                if task_id in download_tasks:
-                    download_tasks[task_id].status = DownloadStatus.FAILED
-                    download_tasks[task_id].error = str(e)
-        
-        download_queue.task_done()
-        logger.info(f"任务处理完成: {task_id}")
-
-
-async def create_download_task(url: str, **kwargs) -> str:
-    """创建下载任务"""
-    task_id = str(uuid.uuid4())
-    
-    # 检测下载类型（如果未指定）
-    download_type = kwargs.get("download_type") or DownloadType.HTTP
-    
-    # 创建任务数据
-    task_data = {
-        "id": task_id,
-        "url": url,
-        "download_type": download_type,
-        "filename": kwargs.get("filename"),
-        "priority": kwargs.get("priority", PriorityLevel.NORMAL),
-        "referer": kwargs.get("referer"),
-        "user_agent": kwargs.get("user_agent"),
-        "status": DownloadStatus.QUEUED,
-        "progress": 0.0,
-        "total_size": 0,
-        "downloaded_size": kwargs.get("start_from", 0),
-        "start_from": kwargs.get("start_from", 0),
-        "start_time": None,
-        "start_time_str": None,
-        "end_time": None,
-        "end_time_str": None,
-        "error": None,
-        "file_path": None,
-        "category": kwargs.get("category"),
-        "category_dir": None,
-        "category_description": None,
-        "retry_count": 0,
-        "download_speed": 0.0,
-        "upload_speed": 0.0,
-        "peers": 0,
-        "seeds": 0,
-        "duration": 0.0,
-        "last_updated": time.time(),
-        "resumed": False,
-        "selected_files": kwargs.get("selected_files"),
-        "files": []
-    }
-    
-    # 创建任务对象
-    task = DownloadTask(** task_data)
-    download_tasks[task_id] = task
-    task_locks[task_id] = asyncio.Lock()
-    
-    # 添加到队列
-    await download_queue.put(task_id)
-    
-    logger.info(f"已创建新下载任务: {task_id} ({download_type.value}: {url})")
-    return task_id
-
-
-async def download_file(task_id: str):
-    """异步HTTP下载"""
-    task = download_tasks.get(task_id)
-    
-    if not task:
-        logger.warning(f"任务 {task_id} 不存在，无法下载")
-        return
-    
-    # 获取任务锁
-    task = download_tasks.get(task_id)
-    if not task:
-        logger.warning(f"任务 {task_id} 不存在，无法下载")
-        return
-    lock = task_locks.get(task_id)
-    if not lock:
-        lock = asyncio.Lock()
-        task_locks[task_id] = lock
-    async with lock:
-        try:
-            # 更新任务状态为下载中
-            task.status = DownloadStatus.DOWNLOADING
-            if not task.start_time:
-                task.start_time = time.time()
-                task.start_time_str = datetime.fromtimestamp(task.start_time).strftime("%Y-%m-%d %H:%M:%S")
-            task.error = None
-            task.download_speed = 0.0
-            task.last_updated = time.time()
-            logger.info(f"开始HTTP下载: {task_id} ({task.url})")
-            # 获取文件名
-            if not task.filename:
-                filename = task.url.split("/")[-1]
-                if not filename:
-                    filename = f"download_{task_id}"
-                task.filename = filename
-            base_dir = settings.download_dir
-            if settings.category_subdirs and task.category:
-                file_dir = base_dir / task.category
-            else:
-                file_dir = base_dir
-            file_path = file_dir / task.filename
-            temp_file_path = f"{file_path}.part"
-            task.file_path = str(file_path)
-            task.category_dir = str(file_dir)
-            resume_position = 0
-            if os.path.exists(temp_file_path):
-                resume_position = os.path.getsize(temp_file_path)
-                task.downloaded_size = resume_position
-                logger.info(f"检测到临时文件，将从 {resume_position} 字节开始续传")
-            if task.start_from and task.start_from > resume_position:
-                resume_position = task.start_from
-                task.downloaded_size = resume_position
-            headers = {}
-            if task.referer:
-                headers["Referer"] = task.referer
-            if task.user_agent:
-                headers["User-Agent"] = task.user_agent
-            else:
-                headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-            if resume_position > 0 and settings.resume_support:
-                headers["Range"] = f"bytes={resume_position}-"
-                task.resumed = True
-            else:
-                task.resumed = False
-                if os.path.exists(temp_file_path):
-                    os.remove(temp_file_path)
-                    logger.info(f"删除旧临时文件: {temp_file_path}")
-            for attempt in range(settings.retry_attempts + 1):
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            task.url,
-                            headers=headers,
-                            timeout=settings.timeout,
-                            ssl=False
-                        ) as response:
-                            response.raise_for_status()
-                            content_length = response.headers.get('Content-Length')
-                            if content_length:
-                                if response.status == 206:
-                                    content_range = response.headers.get('Content-Range', '')
-                                    if content_range.startswith('bytes'):
-                                        total_size = int(content_range.split('/')[-1])
-                                else:
-                                    total_size = int(content_length)
-                                task.total_size = total_size
-                                if total_size > 0:
-                                    task.progress = round((resume_position / total_size) * 100, 2)
-                            mode = 'ab' if resume_position > 0 else 'wb'
-                            async with aiofiles.open(temp_file_path, mode) as f:
-                                start_time = time.time()
-                                chunk_count = 0
-                                async for chunk in response.content.iter_chunked(settings.chunk_size):
-                                    if task.status == DownloadStatus.CANCELLED:
-                                        task.status = DownloadStatus.PAUSED
-                                        task.end_time = time.time()
-                                        task.end_time_str = datetime.fromtimestamp(task.end_time).strftime("%Y-%m-%d %H:%M:%S")
-                                        logger.info(f"任务 {task_id} 已被取消")
-                                        return
-                                    if chunk:
-                                        await f.write(chunk)
-                                        chunk_size = len(chunk)
-                                        task.downloaded_size += chunk_size
-                                        resume_position += chunk_size
-                                        chunk_count += 1
-                                        if chunk_count % 5 == 0:
-                                            elapsed = time.time() - start_time
-                                            if elapsed > 0:
-                                                task.download_speed = round((chunk_size * 5) / (1024 * elapsed), 2)
-                                                start_time = time.time()
-                                        if task.total_size > 0:
-                                            progress = (task.downloaded_size / task.total_size) * 100
-                                            task.progress = round(progress, 2)
-                                        task.last_updated = time.time()
-                                        # 实时保存进度
-                                        await save_active_tasks()
-                    if task.total_size > 0 and task.downloaded_size >= task.total_size:
-                        counter = 1
-                        while file_path.exists():
-                            name = task.filename
-                            ext = Path(name).suffix
-                            name_without_ext = Path(name).stem
-                            file_path = file_dir / f"{name_without_ext}_{counter}{ext}"
-                            counter += 1
-                        os.rename(temp_file_path, str(file_path))
-                        task.file_path = str(file_path)
-                        logger.info(f"HTTP下载完成: {task_id} ({task.file_path})")
-                        break
-                    elif task.total_size == 0:
-                        if os.path.exists(temp_file_path):
-                            counter = 1
-                            while file_path.exists():
-                                name = task.filename
-                                ext = Path(name).suffix
-                                name_without_ext = Path(name).stem
-                                file_path = file_dir / f"{name_without_ext}_{counter}{ext}"
-                                counter += 1
-                            os.rename(temp_file_path, str(file_path))
-                            task.file_path = str(file_path)
-                        logger.info(f"HTTP下载完成（未知大小）: {task_id}")
-                        break
-                    else:
-                        raise Exception(f"下载中断，已完成 {task.downloaded_size}/{task.total_size}")
-                except Exception as e:
-                    task.error = str(e)
-                    task.retry_count = attempt + 1
-                    logger.warning(f"下载尝试 {attempt + 1} 失败: {str(e)}")
-                    if attempt == settings.retry_attempts:
-                        raise e
-                    await asyncio.sleep(settings.retry_delay * (attempt + 1))
-            task.status = DownloadStatus.COMPLETED
-            task.end_time = time.time()
-            task.end_time_str = datetime.fromtimestamp(task.end_time).strftime("%Y-%m-%d %H:%M:%S")
-            task.download_speed = 0.0
-            task.duration = round(task.end_time - task.start_time, 2)
-            history_tasks[task_id] = task.copy()
-            await save_history()
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-                logger.debug(f"已删除临时文件: {temp_file_path}")
-            logger.info(f"任务 {task_id} 已完成，耗时 {format_duration(task.duration)}")
-        except Exception as e:
-            if task_id in download_tasks:
-                task.status = DownloadStatus.FAILED
-                task.error = str(e)
-                task.end_time = time.time()
-                task.end_time_str = datetime.fromtimestamp(task.end_time).strftime("%Y-%m-%d %H:%M:%S")
-                task.download_speed = 0.0
-                logger.error(f"HTTP下载失败: {task_id} - {str(e)}")
-                history_tasks[task_id] = task.copy()
-                await save_history()
-                return
-            # 如果请求中指定了开始位置，使用该位置
-            if task.start_from and task.start_from > resume_position:
-                resume_position = task.start_from
-                task.downloaded_size = resume_position
-            
-            # 添加Range头以支持断点续传
-            headers = {}
-            if task.referer:
-                headers["Referer"] = task.referer
-            if task.user_agent:
-                headers["User-Agent"] = task.user_agent
-            else:
-                headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-            
-            if resume_position > 0 and settings.resume_support:
-                headers["Range"] = f"bytes={resume_position}-"
-                task.resumed = True
-            else:
-                task.resumed = False
-                # 如果不需要续传但临时文件存在，删除它
-                if os.path.exists(temp_file_path):
-                    os.remove(temp_file_path)
-                    logger.info(f"删除旧临时文件: {temp_file_path}")
-            
-            # 多次尝试下载
-            for attempt in range(settings.retry_attempts + 1):
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            task.url, 
-                            headers=headers,
-                            timeout=settings.timeout,
-                            ssl=False
-                        ) as response:
-                            response.raise_for_status()
-                            
-                            # 获取文件总大小
-                            content_length = response.headers.get('Content-Length')
-                            if content_length:
-                                # 处理Range响应的情况
-                                if response.status == 206:  # 部分内容
-                                    content_range = response.headers.get('Content-Range', '')
-                                    if content_range.startswith('bytes'):
-                                        total_size = int(content_range.split('/')[-1])
-                                else:  # 200 OK
-                                    total_size = int(content_length)
-                                
-                                # 更新任务总大小
-                                task.total_size = total_size
-                                
-                                # 计算初始进度
-                                if total_size > 0:
-                                    task.progress = round((resume_position / total_size) * 100, 2)
-                            
-                            # 打开文件（追加模式，如果是续传）
-                            mode = 'ab' if resume_position > 0 else 'wb'
-                            async with aiofiles.open(temp_file_path, mode) as f:
-                                start_time = time.time()
-                                chunk_count = 0
-                                async for chunk in response.content.iter_chunked(settings.chunk_size):
-                                    # 检查任务是否已被取消
-                                    if task.status == DownloadStatus.CANCELLED:
-                                        task.status = DownloadStatus.PAUSED
-                                        task.end_time = time.time()
-                                        task.end_time_str = datetime.fromtimestamp(task.end_time).strftime("%Y-%m-%d %H:%M:%S")
-                                        logger.info(f"任务 {task_id} 已被取消")
-                                        return
-                                    
-                                    if chunk:  # 过滤掉保持连接的空块
-                                        await f.write(chunk)
-                                        chunk_size = len(chunk)
-                                        task.downloaded_size += chunk_size
-                                        resume_position += chunk_size
-                                        
-                                        # 计算下载速度
-                                        chunk_count += 1
-                                        if chunk_count % 5 == 0:  # 每5个块计算一次速度
-                                            elapsed = time.time() - start_time
-                                            if elapsed > 0:
-                                                task.download_speed = round((chunk_size * 5) / (1024 * elapsed), 2)  # KB/s
-                                                start_time = time.time()
-                                        
-                                        # 更新进度
-                                        if task.total_size > 0:
-                                            progress = (task.downloaded_size / task.total_size) * 100
-                                            task.progress = round(progress, 2)
-                                        
-                                        task.last_updated = time.time()
-                        
-                    # 检查是否下载完成
-                    if task.total_size > 0 and task.downloaded_size >= task.total_size:
-                        # 处理文件重名
-                        counter = 1
-                        while file_path.exists():
-                            name = task.filename
-                            ext = Path(name).suffix
-                            name_without_ext = Path(name).stem
-                            file_path = file_dir / f"{name_without_ext}_{counter}{ext}"
-                            counter += 1
-                        # 仅使用扩展名识别，直接重命名
-                        os.rename(temp_file_path, str(file_path))
-                        task.file_path = str(file_path)
-                        
-                        logger.info(f"HTTP下载完成: {task_id} ({task.file_path})")
-                        break
-                    elif task.total_size == 0:
-                        # 未知文件大小，认为下载完成
-                        if os.path.exists(temp_file_path):
-                            # 处理文件重名
-                            counter = 1
-                            while file_path.exists():
-                                name = task.filename
-                                ext = Path(name).suffix
-                                name_without_ext = Path(name).stem
-                                file_path = file_dir / f"{name_without_ext}_{counter}{ext}"
-                                counter += 1
-                            
-                            os.rename(temp_file_path, str(file_path))
-                            task.file_path = str(file_path)
-                        logger.info(f"HTTP下载完成（未知大小）: {task_id}")
-                        break
-                    else:
-                        # 未完成，可能是连接中断，准备重试
-                        raise Exception(f"下载中断，已完成 {task.downloaded_size}/{task.total_size}")
-                
-                except Exception as e:
-                    task.error = str(e)
-                    task.retry_count = attempt + 1
-                    logger.warning(f"下载尝试 {attempt + 1} 失败: {str(e)}")
-                    
-                    # 如果达到最大重试次数，标记为失败
-                    if attempt == settings.retry_attempts:
-                        raise e
-                    
-                    # 等待一段时间后重试
-                    await asyncio.sleep(settings.retry_delay * (attempt + 1))  # 递增延迟
-        
-        except Exception as e:
-            # 处理错误
-            if task_id in download_tasks:
-                task.status = DownloadStatus.FAILED
-                task.error = str(e)
-                task.end_time = time.time()
-                task.end_time_str = datetime.fromtimestamp(task.end_time).strftime("%Y-%m-%d %H:%M:%S")
-                task.download_speed = 0.0
-                
-                logger.error(f"HTTP下载失败: {task_id} - {str(e)}")
-                
-                # 添加到历史记录
-                history_tasks[task_id] = task.copy()
-                await save_history()
-                return
-    
-    # 下载完成
-    task.status = DownloadStatus.COMPLETED
-    task.end_time = time.time()
-    task.end_time_str = datetime.fromtimestamp(task.end_time).strftime("%Y-%m-%d %H:%M:%S")
-    task.download_speed = 0.0  # 下载完成，速度归零
-    task.duration = round(task.end_time - task.start_time, 2)
-    
-    # 添加到历史记录
-    history_tasks[task_id] = task.copy()
-    await save_history()
-    
-    # 如果存在临时文件，删除它
-    if os.path.exists(temp_file_path):
-        os.remove(temp_file_path)
-        logger.debug(f"已删除临时文件: {temp_file_path}")
-    
-    logger.info(f"任务 {task_id} 已完成，耗时 {format_duration(task.duration)}")
-
-
-async def notify_task_update(task_id: str):
-    """通知 WebSocket 客户端任务更新"""
-    task = download_tasks.get(task_id) or history_tasks.get(task_id)
-    if task:
-        await websocket_manager.broadcast({"task_id": task_id, "status": task.status, "progress": task.progress})
-
+# 导出接口
+__all__ = [
+    'init_download_manager',
+    'cleanup_resources',
+    'get_download_tasks',
+    'get_download_task',
+    'get_task_files',
+    'resume_download',
+    'pause_download',
+    'cancel_download',
+    'create_download_task',
+    'process_download_queue',
+    'FILE_CATEGORIES',
+    'DEFAULT_CATEGORY'
+]

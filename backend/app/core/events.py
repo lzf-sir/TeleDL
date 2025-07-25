@@ -14,6 +14,13 @@ async def startup_event(app: FastAPI):
     
     # 初始化下载管理器
     await init_download_manager()
+    
+    # 加载任务数据
+    from app.db.session import get_db
+    db = next(get_db())
+    from app.core.download_manager import load_tasks_on_startup
+    await load_tasks_on_startup(db)
+    
     # 用当前事件循环启动下载队列处理器，避免loop冲突
     import asyncio
     from app.core.download_manager import process_download_queue
@@ -28,6 +35,8 @@ async def shutdown_event(app: FastAPI):
     logger.info("应用关闭中...")
     
     # 清理资源
-    await cleanup_resources()
+    from app.db.session import get_db
+    db = next(get_db())
+    await cleanup_resources(db)
     
     logger.info("应用已关闭")

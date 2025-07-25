@@ -37,8 +37,8 @@ class ConfigUpdate(BaseModel):
     history_max_count: Optional[int] = None
 
 
-class ConfigResponse(BaseModel):
-    """配置响应模型"""
+class ConfigData(BaseModel):
+    """配置数据模型"""
     project_name: str
     api_prefix: str
     cors_origins: List[str]
@@ -63,3 +63,10 @@ class ConfigResponse(BaseModel):
     state_save_interval: int
     save_history: bool
     history_max_count: int
+
+class ConfigResponse(BaseModel):
+    """配置响应模型"""
+    success: bool
+    code: int
+    message: str
+    data: ConfigData

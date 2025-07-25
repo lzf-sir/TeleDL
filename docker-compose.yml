@@ -7,12 +7,13 @@ services:
       dockerfile: Dockerfile
     container_name: tele-backend
     ports:
-      - "8000:8000"
+      - "8048:8048"
     volumes:
       - ./backend:/app
+      - sqlite_data:/app/db  # 持久化 SQLite 数据库文件
+    environment:
+      DATABASE_URL: sqlite:///app/db/db.sqlite3
     command: python main.py
-    depends_on:
-      - db
 
   frontend:
     build:
@@ -27,17 +28,5 @@ services:
     depends_on:
       - backend
 
-  db:
-    image: postgres:15
-    container_name: tele-db
-    environment:
-      POSTGRES_USER: teleuser
-      POSTGRES_PASSWORD: telepassword
-      POSTGRES_DB: teledb
-    ports:
-      - "5432:5432"
-    volumes:
-      - db_data:/var/lib/postgresql/data
-
 volumes:
-  db_data:
+  sqlite_data:
